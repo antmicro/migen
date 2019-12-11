@@ -240,7 +240,7 @@ class Instance(Special):
 
 class _MemoryPort(Special):
     def __init__(self, adr, dat_r, we=None, dat_w=None,
-      async_read=False, re=None, we_granularity=0, mode=WRITE_FIRST,
+      async_read=False, re=None, we_granularity=0, read_width=0, mode=WRITE_FIRST,
       clock_domain="sys"):
         Special.__init__(self)
         self.adr = adr
@@ -250,6 +250,7 @@ class _MemoryPort(Special):
         self.async_read = async_read
         self.re = re
         self.we_granularity = we_granularity
+        self.read_width = read_width
         self.mode = mode
         self.clock = ClockSignal(clock_domain)
 
@@ -289,12 +290,12 @@ class Memory(Special):
         return _MemoryLocation(self, index)
 
     def get_port(self, write_capable=False, async_read=False,
-      has_re=False, we_granularity=0, mode=WRITE_FIRST,
+      has_re=False, we_granularity=0, read_width=0, mode=WRITE_FIRST,
       clock_domain="sys"):
         if we_granularity >= self.width:
             we_granularity = 0
         adr = Signal(max=self.depth)
-        dat_r = Signal(self.width)
+        dat_r = Signal(read_width if read_width else self.width)
         if write_capable:
             if we_granularity:
                 we = Signal(self.width//we_granularity)
@@ -309,7 +310,7 @@ class Memory(Special):
         else:
             re = None
         mp = _MemoryPort(adr, dat_r, we, dat_w,
-          async_read, re, we_granularity, mode,
+          async_read, re, we_granularity, read_width, mode,
           clock_domain)
         self.ports.append(mp)
         return mp
@@ -337,11 +338,34 @@ class Memory(Special):
                     r += "reg [" + str(adrbits-1) + ":0] " \
                         + gn(adr_reg) + ";\n"
                     adr_regs[id(port)] = adr_reg
+                    # TODO:
                 else:
-                    data_reg = Signal(name_override="memdat")
-                    r += "reg [" + str(memory.width-1) + ":0] " \
-                        + gn(data_reg) + ";\n"
-                    data_regs[id(port)] = data_reg
+                    #  read only, no need for separate memadr register
+                    if port.read_width == 0:
+                        data_reg = Signal(name_override="memdat")
+                        r += "reg [" + str(memory.width-1) + ":0] " \
+                            + gn(data_reg) + ";\n"
+                        data_regs[id(port)] = data_reg
+                    else:
+                        data_reg = Signal(name_override="memdat")
+                        r += "reg [" + str(port.read_width-1) + ":0] " \
+                            + gn(data_reg) + ";\n"
+                        data_regs[id(port)] = data_reg
+### was:
+#
+# reg [7:0] mem[0:4095];
+# reg [7:0] memdat;
+# always @(posedge sys_clk_1) begin
+#         memdat <= mem[rom_adr];
+# end
+#
+### I want:
+#
+# reg [7:0] mem[0:4095];
+# reg [31:0] memdat;
+# always @(posedge sys_clk_1) begin
+#         memdat <= { mem[rom_adr], mem[rom_adr+1], mem[rom_adr+2], mem[rom_adr+3] };
+# end
 
         for port in memory.ports:
             r += "always @(posedge " + gn(port.clock) + ") begin\n"
@@ -363,7 +387,22 @@ class Memory(Special):
                 else:
                     bassign = gn(data_regs[id(port)]) + " <= " + gn(memory) + "[" + gn(port.adr) + "];\n"
                     if port.mode == READ_FIRST:
-                        rd = "\t" + bassign
+                        if port.read_width:
+                            assert port.read_width > memory.width, '%s > %s' % (port.read_width, memory.width)
+
+                            n = port.read_width // memory.width
+                            words = []
+
+                            for i in reversed(range(n)):
+                                word = '{name}[{adr} + {i}]'.format(
+                                    name=gn(memory), adr=gn(port.adr), i=i)
+                                words.append(word)
+
+                            rd = "\t{dst} <= {{ {words} }};\n".format(
+                                dst=gn(data_regs[id(port)]), words=', '.join(words))
+
+                        else:
+                            rd = "\t" + bassign
                     elif port.mode == NO_CHANGE:
                         rd = "\tif (!" + gn(port.we) + ")\n" \
                           + "\t\t" + bassign
@@ -372,6 +411,7 @@ class Memory(Special):
                 else:
                     r += "\tif (" + gn(port.re) + ")\n"
                     r += "\t" + rd.replace("\n\t", "\n\t\t")
+
             r += "end\n\n"
 
         for port in memory.ports:
@@ -379,8 +419,10 @@ class Memory(Special):
                 r += "assign " + gn(port.dat_r) + " = " + gn(memory) + "[" + gn(port.adr) + "];\n"
             else:
                 if port.mode == WRITE_FIRST:
+                    # generate "assign sram_dat_r = mem_1[memadr];"
                     r += "assign " + gn(port.dat_r) + " = " + gn(memory) + "[" + gn(adr_regs[id(port)]) + "];\n"
                 else:
+                    # generate "assign rom_dat_r = memdat;"
                     r += "assign " + gn(port.dat_r) + " = " + gn(data_regs[id(port)]) + ";\n"
         r += "\n"
 
